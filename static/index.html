@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="et">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AG Kultuurivoog</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+        .modal { transition: opacity 0.2s ease-in-out; }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-900">
+
+    <div class="container mx-auto max-w-4xl p-4">
+        <!-- Header -->
+        <header class="mb-6 flex flex-col md:flex-row justify-between items-center gap-4 bg-white p-4 rounded-lg shadow">
+            <h1 class="text-2xl font-bold text-indigo-700">AG Kultuurivoog</h1>
+            
+            <div class="flex flex-wrap gap-2 text-sm">
+                <button onclick="loadEvents('today')" class="filter-btn px-4 py-2 rounded bg-gray-200 hover:bg-indigo-100 transition" data-range="today">Täna</button>
+                <button onclick="loadEvents('7days')" class="filter-btn px-4 py-2 rounded bg-indigo-600 text-white shadow" data-range="7days">7 päeva</button>
+                <button onclick="loadEvents('14days')" class="filter-btn px-4 py-2 rounded bg-gray-200 hover:bg-indigo-100 transition" data-range="14days">14 päeva</button>
+                <button onclick="loadEvents('30days')" class="filter-btn px-4 py-2 rounded bg-gray-200 hover:bg-indigo-100 transition" data-range="30days">30 päeva</button>
+            </div>
+
+            <label class="flex items-center gap-2 cursor-pointer select-none">
+                <input type="checkbox" id="kidsFilter" onclick="toggleKids()" class="w-5 h-5 accent-pink-500">
+                <span class="text-sm font-medium">Lastele</span>
+            </label>
+        </header>
+
+        <!-- Table -->
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead class="bg-gray-50 text-gray-600 uppercase text-xs">
+                        <tr>
+                            <th class="p-4 border-b">Aeg</th>
+                            <th class="p-4 border-b">Pealkiri</th>
+                            <th class="p-4 border-b">Koht</th>
+                            <th class="p-4 border-b">Info</th>
+                        </tr>
+                    </thead>
+                    <tbody id="eventBody" class="text-sm divide-y divide-gray-100">
+                        <!-- JS fills this -->
+                    </tbody>
+                </table>
+            </div>
+            <div id="loading" class="p-8 text-center text-gray-500 hidden">Laen andmeid...</div>
+            <div id="emptyMsg" class="p-8 text-center text-gray-400 hidden">Sündmused puuduvad.</div>
+        </div>
+    </div>
+
+    <!-- Modal -->
+    <div id="modal" class="fixed inset-0 bg-black bg-opacity-50 hidden flex items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-xl shadow-2xl max-w-md w-full p-6 relative animate-fade-in-up">
+            <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+            
+            <div id="modalContent">
+                <span id="mGenre" class="inline-block px-2 py-1 bg-indigo-100 text-indigo-800 text-xs rounded mb-2">Teater</span>
+                <h2 id="mTitle" class="text-xl font-bold mb-1">Pealkiri</h2>
+                <p id="mDateVenue" class="text-gray-500 text-sm mb-4">01.01.2026 • 19:00 • Estonia</p>
+                
+                <div id="mDescription" class="prose prose-sm text-gray-600 mb-6 max-h-60 overflow-y-auto">
+                    Kirjeldus...
+                </div>
+
+                <div class="flex gap-3">
+                    <a id="mTicketBtn" href="#" target="_blank" class="flex-1 bg-indigo-600 text-white text-center py-2 rounded-lg hover:bg-indigo-700 transition">Osta pilet</a>
+                    <a id="mSourceBtn" href="#" target="_blank" class="flex-1 border border-gray-300 text-gray-700 text-center py-2 rounded-lg hover:bg-gray-50 transition">Vaata allikat</a>
+                </div>
+                
+                <div id="mNotFree" class="mt-4 text-center text-xs text-green-600 font-medium hidden">
+                    TASUTA (<span id="mFreeReason"></span>)
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentRange = '7days';
+
+        function formatDate(isoDate) {
+            const [y, m, d] = isoDate.split('-');
+            return `${d}.${m}.${y}`;
+        }
+
+        async function loadEvents(range) {
+            currentRange = range;
+            const showKids = document.getElementById('kidsFilter').checked;
+            
+            // UI Update
+            document.querySelectorAll('.filter-btn').forEach(btn => {
+                if(btn.dataset.range === range) {
+                    btn.classList.add('bg-indigo-600', 'text-white', 'shadow');
+                    btn.classList.remove('bg-gray-200', 'hover:bg-indigo-100');
+                } else {
+                    btn.classList.remove('bg-indigo-600', 'text-white', 'shadow');
+                    btn.classList.add('bg-gray-200', 'hover:bg-indigo-100');
+                }
+            });
+
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('eventBody').innerHTML = '';
+            document.getElementById('emptyMsg').classList.add('hidden');
+
+            try {
+                const res = await fetch(`/events/${range}?show_kids=${showKids}`);
+                const data = await res.json();
+                
+                document.getElementById('loading').classList.add('hidden');
+                
+                if (data.length === 0) {
+                    document.getElementById('emptyMsg').classList.remove('hidden');
+                    return;
+                }
+
+                const tbody = document.getElementById('eventBody');
+                data.forEach(ev => {
+                    const row = document.createElement('tr');
+                    row.className = 'hover:bg-gray-50 transition cursor-pointer';
+                    row.onclick = () => openModal(ev);
+                    
+                    const timeDisp = ev.time ? ev.time.substring(0, 5) : '<span class="text-gray-300">-</span>';
+                    const cityDisp = ev.city ? `<span class="text-xs text-gray-400 ml-1">(${ev.city})</span>` : '';
+                    const genreBadge = `<span class="px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-600">${ev.genre || 'Muu'}</span>`;
+
+                    row.innerHTML = `
+                        <td class="p-4 border-b whitespace-nowrap text-gray-600 font-mono text-xs">
+                            ${formatDate(ev.date)}<br>
+                            <span class="text-lg text-gray-800 font-bold">${timeDisp}</span>
+                        </td>
+                        <td class="p-4 border-b">
+                            <div class="font-medium text-gray-900">${ev.title}</div>
+                            <div class="mt-1 flex gap-2">${genreBadge} ${ev.is_free ? '<span class="text-green-600 text-xs font-bold">TASUTA</span>' : ''}</div>
+                        </td>
+                        <td class="p-4 border-b text-gray-600">
+                            ${ev.venue} ${cityDisp}
+                        </td>
+                        <td class="p-4 border-b text-right">
+                             <span class="text-indigo-600 text-xl">&rsaquo;</span>
+                        </td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+            } catch (err) {
+                console.error(err);
+                document.getElementById('loading').textContent = 'Viga andmete laadimisel.';
+            }
+        }
+
+        function toggleKids() {
+            loadEvents(currentRange);
+        }
+
+        function openModal(ev) {
+            const modal = document.getElementById('modal');
+            
+            document.getElementById('mTitle').textContent = ev.title;
+            document.getElementById('mGenre').textContent = ev.genre || 'Info';
+            document.getElementById('mDateVenue').textContent = `${formatDate(ev.date)} • ${ev.time || '-'} • ${ev.venue} ${ev.city ? '('+ev.city+')' : ''}`;
+            document.getElementById('mDescription').textContent = ev.description || "Kirjeldus puudub.";
+            
+            const btn = document.getElementById('mTicketBtn');
+            if (ev.ticket_url) {
+                btn.href = ev.ticket_url;
+                btn.classList.remove('hidden');
+                btn.textContent = "Osta pilet";
+            } else {
+                // If no ticket url, maybe treat source url as ticket?
+                // Or hide button? 
+                // Requirement: "kuvab piletinupu või infolingi"
+                btn.href = ev.source_url;
+                btn.textContent = "Vaata infot";
+            }
+
+            document.getElementById('mSourceBtn').href = ev.source_url || '#';
+            
+            if (ev.is_free) {
+                document.getElementById('mNotFree').classList.remove('hidden');
+                document.getElementById('mFreeReason').textContent = ev.free_reason;
+            } else {
+                document.getElementById('mNotFree').classList.add('hidden');
+            }
+
+            modal.classList.remove('hidden');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.add('hidden');
+        }
+
+        // Close on BG click
+        document.getElementById('modal').addEventListener('click', (e) => {
+            if (e.target.id === 'modal') closeModal();
+        });
+
+        // Init
+        loadEvents('7days');
+    </script>
+</body>
+</html>
