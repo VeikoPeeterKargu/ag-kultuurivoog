@@ -14,16 +14,10 @@ def get_db_connection():
         return None
 
 def ensure_views():
-    # In Postgres, views are persistent, but we can recreate them just in case schema changed.
-    # Actually, db_init does this. But we can call db_init logic here or just rely on db_init.
-    # To be safe and follow the pattern:
     conn = get_db_connection()
     if not conn: return {}
     
     cur = conn.cursor()
-    # Assuming views exist from db_init, just count.
-    # Or should we recreate? db_init is better place. 
-    # Let's just count here.
     try:
         cur.execute("SELECT COUNT(*) FROM v_events_clean")
         c_clean = cur.fetchone()[0]
@@ -35,7 +29,18 @@ def ensure_views():
         conn.close()
         return {"clean": 0, "adults": 0}
 
-def run_cleanup():
+def run_cleanup(check_safety=False, parsed_count=0):
+    """
+    check_safety: If True, only cleanup if we actually parsed something new 
+                  (or at least connection was successful).
+    parsed_count: Number of items parsed in the scraper run.
+    """
+    
+    # Safety Check
+    if check_safety and parsed_count == 0:
+        print("CLEANUP_SKIPPED_NO_NEW_DATA: true")
+        return {"deleted": 0, "skipped": True}
+
     conn = get_db_connection()
     if not conn: return {"deleted": 0, "total_after": 0}
     

@@ -7,8 +7,12 @@ import hashlib
 import datetime
 import json
 import re
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-TEATER_EE_URL = "https://teater.ee/teatriinfo/mangukava/"
+# Default URL, can be overridden by env
+TEATER_EE_URL_DEFAULT = "https://teater.ee/teatriinfo/mangukava/"
 
 MONTHS = {
     "jaanuar": "01", "veebruar": "02", "märts": "03", "aprill": "04", "mai": "05", "juuni": "06",
@@ -105,34 +109,79 @@ def get_db_connection():
         return None
 
 def run_scraper():
+    # Setup stats
+    stats = {
+        "parsed": 0, "inserted": 0, "updated": 0, 
+        "error": None, "blocked": False, "status": 0
+    }
+    
     conn = get_db_connection()
     if not conn:
-        return {"parsed": 0, "inserted": 0, "updated": 0, "error": "No DB connection"}
+        stats["error"] = "No DB connection"
+        return stats
     
-    inserted_count = 0
-    updated_count = 0
-    total_parsed = 0
+    target_url = os.getenv("TEATER_URL", TEATER_EE_URL_DEFAULT)
+    
+    # Session setup with robust headers
+    session = requests.Session()
+    
+    # Retry strategy (Backoff)
+    retries = Retry(
+        total=3,
+        backoff_factor=2, # 2s, 4s, 8s
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retries))
     
     HEADERS = {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Language": "et-EE,et;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Connection": "keep-alive"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "et-EE,et;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate", 
+        "Sec-Fetch-Dest": "document",
+        "Referer": "https://teater.ee/",
+        "DNT": "1"
     }
-
+    
     try:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(max_retries=1)
-        session.mount('https://', adapter)
+        # Warm-up: Visit homepage first
+        print("Scraper: Warming up (GET /)...")
+        session.get("https://teater.ee", headers=HEADERS, timeout=10)
+        time.sleep(1) # Be polite
         
-        response = session.get(TEATER_EE_URL, headers=HEADERS, timeout=20)
-        print(f"TEATER_HTTP_STATUS: {response.status_code}")
+        # Real request
+        print(f"Scraper: Fetching {target_url}...")
+        response = session.get(target_url, headers=HEADERS, timeout=20)
+        
+        status_code = response.status_code
+        stats["status"] = status_code
+        print(f"TEATER_HTTP_STATUS: {status_code}")
+        
+        # Check if actually blocked or error
+        if status_code in [403, 429]:
+            print(f"TEATER_BLOCKED: true (Status {status_code})")
+            stats["blocked"] = True
+            conn.close()
+            return stats
+            
         response.raise_for_status()
+        
     except Exception as e:
         print(f"Error fetching: {e}")
+        stats["error"] = str(e)
+        if hasattr(e, 'response') and e.response:
+             stats["status"] = e.response.status_code
+             if e.response.status_code in [403, 429]:
+                 stats["blocked"] = True
         conn.close()
-        return {"parsed": 0, "inserted": 0, "updated": 0, "error": str(e)}
+        return stats
 
+    # Parse logic
     soup = BeautifulSoup(response.text, 'html.parser')
     date_blocks = soup.select('.post-etendus__item')
     
@@ -140,6 +189,9 @@ def run_scraper():
     cur = conn.cursor()
     
     sample_events = []
+    inserted_count = 0
+    updated_count = 0
+    total_parsed = 0
 
     for block in date_blocks:
         if total_parsed >= 50: break
@@ -162,8 +214,6 @@ def run_scraper():
                 
                 time_el = ev_div.select_one('.block-etendus__time')
                 time_str = time_el.get_text(strip=True) if time_el else None
-                # Postgres TIME requires HH:MM:SS or HH:MM. Ensure compatibility. 
-                # If parsed format is valid (e.g. 19:00), fine.
                 
                 venue = ""
                 city = ""
@@ -254,12 +304,14 @@ def run_scraper():
     print(f"INSERTED: {inserted_count}")
     print(f"UPDATED: {updated_count}")
     
-    for ev in sample_events:
-        print(json.dumps(ev, ensure_ascii=False))
+    # Update stats
+    stats["parsed"] = total_parsed
+    stats["inserted"] = inserted_count
+    stats["updated"] = updated_count
         
     cur.close()
     conn.close()
-    return {"parsed": total_parsed, "inserted": inserted_count, "updated": updated_count}
+    return stats
 
 if __name__ == "__main__":
     run_scraper()
