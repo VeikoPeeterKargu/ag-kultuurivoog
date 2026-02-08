@@ -67,9 +67,18 @@ def generate_canonical_id(title, date_str, venue, city, time_str):
     canonical_raw = f"{norm_title}|{date_str}|{norm_venue}|{norm_city}|{clean_time}"
     return hashlib.sha1(canonical_raw.encode('utf-8')).hexdigest()
 
-def scrape_concert_ee():
-    conn = sqlite3.connect(DB_FILE)
+def run_scraper(db_path=None):
+    if db_path is None: db_path = DB_FILE
+
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    # Ensure tables exist implicitly or check? Assuming schema exists.
+    try:
+        cursor.execute("SELECT 1 FROM events LIMIT 1")
+    except sqlite3.OperationalError:
+         # In real scheduler, might need init logic or rely on main init
+         pass
+
     existing_ids = set(row[0] for row in cursor.execute("SELECT canonical_event_id FROM events").fetchall())
     
     headers = {
@@ -81,17 +90,12 @@ def scrape_concert_ee():
     except Exception as e:
         print(f"Error fetching {CONCERT_EE_URL}: {e}")
         conn.close()
-        return
+        return {"parsed": 0, "inserted": 0, "updated": 0, "error": str(e)}
 
     soup = BeautifulSoup(response.text, 'html.parser')
     
-    # NEW STRATEGY: Iterate over columns, check for event date inside
-    # Structure seen in dump: <div class="col"> ... <div class="event"> ... <div class="date">
-    # We can iterate .event or .col that contains .event
-    
     event_blocks = soup.select('.event')
     if not event_blocks:
-        # Fallback to col + check for date
         cols = soup.select('.col')
         event_blocks = []
         for c in cols:
@@ -101,7 +105,6 @@ def scrape_concert_ee():
     parsed = 0
     inserted = 0
     updated = 0
-    events_found = []
     current_time = datetime.datetime.now().isoformat()
 
     for block in event_blocks:
@@ -109,10 +112,7 @@ def scrape_concert_ee():
         try:
             # Title
             title_el = block.select_one('h3 a')
-            if not title_el: 
-                 # Maybe generic
-                 title_el = block.select_one('.title a')
-            
+            if not title_el: title_el = block.select_one('.title a')
             if not title_el: continue
             
             title = title_el.get_text(strip=True)
@@ -123,18 +123,13 @@ def scrape_concert_ee():
             # Date
             date_el = block.select_one('.date')
             date_text = date_el.get_text(strip=True) if date_el else ""
-            
             date_iso = parse_estonian_full_date(date_text)
             if not date_iso: continue 
 
-            # Time - usually hidden in list view, ignore
             time_str = None
-            
-            # Venue - usually hidden in list view, ignore or default
             venue = "" 
             city = ""
             
-            # Enrich
             is_free, free_reason = detect_free(title, "")
             canonical_id = generate_canonical_id(title, date_iso, venue, city, time_str)
             
@@ -154,7 +149,6 @@ def scrape_concert_ee():
                 'created_at': current_time, 'updated_at': current_time
             }
             parsed += 1
-            events_found.append(event)
             
             cursor.execute("""
                 INSERT INTO events (
@@ -183,25 +177,8 @@ def scrape_concert_ee():
         except Exception: pass
         
     conn.commit()
-    
-    print(f"CONCERTS_PARSED: {parsed}")
-    print(f"INSERTED: {inserted}")
-    print(f"UPDATED: {updated}")
-    
-    db_total = cursor.execute("SELECT count(*) FROM events").fetchone()[0]
-    print(f"DB_TOTAL_EVENTS_NOW: {db_total}")
-    
-    print("GENRE_STATS:")
-    for g, c in cursor.execute("SELECT genre, COUNT(*) FROM events GROUP BY genre").fetchall():
-        print(f"  {g}: {c}")
-
-    print("\nSample Data (5 Rows):")
-    for ev in events_found[:5]:
-        out = {k: ev[k] for k in ['date', 'time', 'title', 'venue', 'city', 'genre', 'is_free', 'source_url', 'canonical_event_id']}
-        print(json.dumps(out, ensure_ascii=False))
-
-    print("\nCREATED_FILES: .gitignore, requirements.txt, README.md, schema.sql")
     conn.close()
+    return {"parsed": parsed, "inserted": inserted, "updated": updated}
 
 if __name__ == "__main__":
-    scrape_concert_ee()
+    print(run_scraper())

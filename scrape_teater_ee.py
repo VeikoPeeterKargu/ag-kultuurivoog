@@ -183,12 +183,13 @@ def run_reports(cursor, run_id):
         out = {k: s[k] for k in req_fields if k in s}
         print(json.dumps(out, ensure_ascii=False))
 
-def scrape_teater_ee(run_id=1):
-    conn = sqlite3.connect(DB_FILE)
+def run_scraper(db_path=None):
+    if db_path is None: db_path = DB_FILE
+    
+    conn = sqlite3.connect(db_path)
     init_db(conn)
     cursor = conn.cursor()
 
-    # Pre-fetch existing IDs for update tracking
     existing_ids = set(row[0] for row in cursor.execute("SELECT canonical_event_id FROM events").fetchall())
 
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -198,13 +199,12 @@ def scrape_teater_ee(run_id=1):
     except Exception as e:
         print(f"Error: {e}")
         conn.close()
-        return
+        return {"parsed": 0, "inserted": 0, "updated": 0, "error": str(e)}
 
     soup = BeautifulSoup(response.text, 'html.parser')
     date_blocks = soup.select('.post-etendus__item')
     
     total_parsed = 0
-    # True Inserted/Updated tracking
     inserted_count = 0
     updated_count = 0
     
@@ -233,11 +233,7 @@ def scrape_teater_ee(run_id=1):
                 
                 venue = ""
                 city = ""
-                # Improved venue extraction logic? Using grep insights:
-                # Often just `block-etendus__paragraph-small`
                 ps = ev_div.select('.block-etendus__paragraph-small')
-                # Usually: 1. Hashtags/Genre 2. Venue
-                # But sometimes first logic works.
                 for p in ps:
                     txt = p.get_text(strip=True)
                     if "vaatajale" in txt.lower() or "lavastus" in txt.lower(): continue 
@@ -254,20 +250,17 @@ def scrape_teater_ee(run_id=1):
                 img_el = ev_div.select_one('img')
                 image_url = img_el['src'] if img_el else ""
                 
-                # Enrich
                 is_kids = is_kids_event_check(title, venue, "")
                 genre = detect_genre(title, "", venue)
                 is_free, free_reason = detect_free(title, "")
                 
                 canonical_id = generate_canonical_id(title, date_iso, venue, city, time_str)
                 
-                # Check status
                 if canonical_id in existing_ids:
                     updated_count += 1
                 else:
                     inserted_count += 1
                 
-                # UPSERT
                 cursor.execute("""
                     INSERT INTO events (
                         title, genre, date, time, venue, city, 
@@ -313,17 +306,10 @@ def scrape_teater_ee(run_id=1):
             except Exception: pass
             
     conn.commit()
-    print(f"\nRUN {run_id} LOG:")
-    print(f"TOTAL_PARSED: {total_parsed}")
-    print(f"INSERTED: {inserted_count}")
-    print(f"UPDATED: {updated_count}")
-    
-    run_reports(cursor, run_id)
     conn.close()
+    return {"parsed": total_parsed, "inserted": inserted_count, "updated": updated_count}
 
 if __name__ == "__main__":
-    print("--- FIRST RUN ---")
-    scrape_teater_ee(run_id=1)
-    
-    print("\n\n--- SECOND RUN (DEDUPE CHECK) ---")
-    scrape_teater_ee(run_id=2)
+    print("--- RUNNING SCRAPER ---")
+    stats = run_scraper()
+    print(stats)

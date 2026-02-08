@@ -1,10 +1,6 @@
-import sqlite3
-import json
-
-DB_FILE = "ag_kultuurivoog.db"
-
-def create_views():
-    conn = sqlite3.connect(DB_FILE)
+def ensure_views(db_path=None):
+    if db_path is None: db_path = DB_FILE
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     # 1.1 v_events_clean
@@ -38,19 +34,15 @@ def create_views():
     """)
     
     conn.commit()
-    print("VIEWS_CREATED: v_events_clean, v_events_clean_adults")
-    
-    # Counts
     c_clean = cursor.execute("SELECT COUNT(*) FROM v_events_clean").fetchone()[0]
     c_adults = cursor.execute("SELECT COUNT(*) FROM v_events_clean_adults").fetchone()[0]
-    print(f"VIEW_COUNTS: clean={c_clean}, adults={c_adults}")
     conn.close()
+    return {"clean": c_clean, "adults": c_adults}
 
-def cleanup_data():
-    conn = sqlite3.connect(DB_FILE)
+def run_cleanup(db_path=None):
+    if db_path is None: db_path = DB_FILE
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
-    print("\nCLEANUP_STARTED")
     
     # 2.2 Reegel A (Keywords)
     cursor.execute("""
@@ -66,7 +58,6 @@ def cleanup_data():
     deleted_a = cursor.rowcount
     
     # 2.2 Reegel B (No time for concerts)
-    # Check if time column has empty strings or NULL
     cursor.execute("""
         DELETE FROM events
         WHERE source = 'concert.ee'
@@ -76,31 +67,13 @@ def cleanup_data():
     deleted_b = cursor.rowcount
     
     conn.commit()
-    
     total_deleted = deleted_a + deleted_b
-    print(f"DELETED_RECORDS: {total_deleted}")
-    
     total_events = cursor.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    print(f"DB_TOTAL_EVENTS_AFTER_CLEANUP: {total_events}")
-    
-    # Sample concert.ee events
-    concerts = cursor.execute("""
-        SELECT date, time, title, venue, city, genre, source_url, canonical_event_id
-        FROM events
-        WHERE source = 'concert.ee'
-        LIMIT 3
-    """).fetchall()
-    
-    columns = ['date', 'time', 'title', 'venue', 'city', 'genre', 'source_url', 'canonical_event_id']
-    
-    if not concerts:
-        print("CONCERT_EVENTS_REMAINING: 0")
-    else:
-        for row in concerts:
-            print(json.dumps(dict(zip(columns, row)), ensure_ascii=False))
-            
     conn.close()
+    return {"deleted": total_deleted, "total_after": total_events}
 
 if __name__ == "__main__":
-    create_views()
-    cleanup_data()
+    v_stats = ensure_views()
+    print(f"VIEWS: {v_stats}")
+    c_stats = run_cleanup()
+    print(f"CLEANUP: {c_stats}")
