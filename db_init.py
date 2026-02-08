@@ -1,71 +1,92 @@
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+import os
 import sys
+import psycopg2
+
+def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        print("Error: DATABASE_URL environment variable is not set.")
+        sys.exit(1)
+    return psycopg2.connect(db_url)
 
 def init_db():
-    # Default connection parameters - adjust if needed or take from env
-    db_params = {
-        "user": "vpk", # Try current user first, often works on macOS with Homebrew
-        "host": "localhost",
-        "port": "5432"
-    }
+    conn = get_db_connection()
+    cur = conn.cursor()
 
     try:
-        # Connect to 'postgres' db to create new db
-        print("Connecting to postgres database...")
-        try:
-            conn = psycopg2.connect(dbname="postgres", **db_params)
-        except psycopg2.OperationalError:
-             # Fallback to 'postgres' user if current user fails
-            print("Connection with current user failed, trying 'postgres' user...")
-            db_params["user"] = "postgres"
-            conn = psycopg2.connect(dbname="postgres", **db_params)
-            
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        cur = conn.cursor()
+        # Create table with stricter schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                genre TEXT,
+                date DATE NOT NULL,
+                time TIME,
+                venue TEXT,
+                city TEXT,
+                is_free INTEGER DEFAULT 0,
+                free_reason TEXT,
+                is_kids_event INTEGER DEFAULT 0,
+                description TEXT,
+                image_url TEXT,
+                ticket_url TEXT,
+                canonical_event_id TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL DEFAULT 'teater.ee',
+                source_url TEXT,
+                last_seen_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
 
-        # Check if database exists
-        cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = 'kultuurivoog'")
-        exists = cur.fetchone()
+        # Indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events(date);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_is_kids ON events(is_kids_event);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_genre ON events(genre);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_canonical ON events(canonical_event_id);")
+
+        print("DB_INIT_OK: true")
+
+        # Views
+        # 1.1 v_events_clean (Only future events)
+        cur.execute("""
+            CREATE OR REPLACE VIEW v_events_clean AS
+            SELECT
+                id,
+                date,
+                time,
+                title,
+                genre,
+                venue,
+                city,
+                is_free,
+                is_kids_event,
+                description,
+                source,
+                source_url,
+                ticket_url,
+                canonical_event_id
+            FROM events
+            WHERE date >= CURRENT_DATE
+        """)
         
-        if not exists:
-            print("Creating database 'kultuurivoog'...")
-            cur.execute("CREATE DATABASE kultuurivoog")
-        else:
-            print("Database 'kultuurivoog' already exists.")
+        # 1.2 v_events_clean_adults (Future + No Kids)
+        cur.execute("""
+            CREATE OR REPLACE VIEW v_events_clean_adults AS
+            SELECT *
+            FROM v_events_clean
+            WHERE is_kids_event = 0
+        """)
+
+        conn.commit()
+        print("VIEWS_OK: true")
         
-        cur.close()
-        conn.close()
-
-        # Connect to the new database
-        print("Connecting to 'kultuurivoog' database...")
-        conn = psycopg2.connect(dbname="kultuurivoog", **db_params)
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        cur = conn.cursor()
-
-        # Read schema.sql
-        print("Applying schema...")
-        with open('schema.sql', 'r') as f:
-            schema = f.read()
-        
-        cur.execute(schema)
-        print("Schema applied successfully.")
-
-        # Verify table creation
-        cur.execute("SELECT to_regclass('public.events')")
-        if cur.fetchone()[0]:
-             print("Table 'events' verified.")
-        else:
-             print("Error: Table 'events' not found after schema application.")
-             sys.exit(1)
-
-        cur.close()
-        conn.close()
-        print("Database initialization complete.")
-
     except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        print(f"DB_INIT_ERROR: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
 
 if __name__ == "__main__":
     init_db()

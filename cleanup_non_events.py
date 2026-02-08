@@ -1,79 +1,81 @@
-def ensure_views(db_path=None):
-    if db_path is None: db_path = DB_FILE
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    # 1.1 v_events_clean
-    cursor.execute("DROP VIEW IF EXISTS v_events_clean")
-    cursor.execute("""
-        CREATE VIEW v_events_clean AS
-        SELECT
-            id,
-            date,
-            time,
-            title,
-            genre,
-            venue,
-            city,
-            is_free,
-            is_kids_event,
-            source,
-            source_url,
-            ticket_url,
-            canonical_event_id
-        FROM events
-    """)
-    
-    # 1.2 v_events_clean_adults
-    cursor.execute("DROP VIEW IF EXISTS v_events_clean_adults")
-    cursor.execute("""
-        CREATE VIEW v_events_clean_adults AS
-        SELECT *
-        FROM v_events_clean
-        WHERE is_kids_event = 0
-    """)
-    
-    conn.commit()
-    c_clean = cursor.execute("SELECT COUNT(*) FROM v_events_clean").fetchone()[0]
-    c_adults = cursor.execute("SELECT COUNT(*) FROM v_events_clean_adults").fetchone()[0]
-    conn.close()
-    return {"clean": c_clean, "adults": c_adults}
+import os
+import sys
+import psycopg2
 
-def run_cleanup(db_path=None):
-    if db_path is None: db_path = DB_FILE
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        print("Error: DATABASE_URL not set")
+        return None
+    try:
+        return psycopg2.connect(db_url)
+    except Exception as e:
+        print(f"DB Connection Error: {e}")
+        return None
+
+def ensure_views():
+    # In Postgres, views are persistent, but we can recreate them just in case schema changed.
+    # Actually, db_init does this. But we can call db_init logic here or just rely on db_init.
+    # To be safe and follow the pattern:
+    conn = get_db_connection()
+    if not conn: return {}
+    
+    cur = conn.cursor()
+    # Assuming views exist from db_init, just count.
+    # Or should we recreate? db_init is better place. 
+    # Let's just count here.
+    try:
+        cur.execute("SELECT COUNT(*) FROM v_events_clean")
+        c_clean = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM v_events_clean_adults")
+        c_adults = cur.fetchone()[0]
+        conn.close()
+        return {"clean": c_clean, "adults": c_adults}
+    except:
+        conn.close()
+        return {"clean": 0, "adults": 0}
+
+def run_cleanup():
+    conn = get_db_connection()
+    if not conn: return {"deleted": 0, "total_after": 0}
+    
+    cur = conn.cursor()
     
     # 2.2 Reegel A (Keywords)
-    cursor.execute("""
+    cur.execute("""
         DELETE FROM events
         WHERE (
-            lower(title) LIKE '%galerii%'
-            OR lower(title) LIKE '%foto%'
-            OR lower(title) LIKE '%pildid%'
-            OR lower(title) LIKE '%tähistas%'
-            OR lower(title) LIKE '%tagasivaade%'
+            title ILIKE '%galerii%'
+            OR title ILIKE '%foto%'
+            OR title ILIKE '%pildid%'
+            OR title ILIKE '%tähistas%'
+            OR title ILIKE '%tagasivaade%'
         )
     """)
-    deleted_a = cursor.rowcount
+    deleted_a = cur.rowcount
     
     # 2.2 Reegel B (No time for concerts)
-    cursor.execute("""
+    cur.execute("""
         DELETE FROM events
         WHERE source = 'concert.ee'
         AND genre = 'Kontsert'
-        AND (time IS NULL OR trim(time) = '')
+        AND (time IS NULL)
     """)
-    deleted_b = cursor.rowcount
+    deleted_b = cur.rowcount
     
     conn.commit()
     total_deleted = deleted_a + deleted_b
-    total_events = cursor.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    
+    print(f"DELETED_RECORDS: {total_deleted}")
+    
+    cur.execute("SELECT COUNT(*) FROM events")
+    total_after = cur.fetchone()[0]
+    print(f"DB_TOTAL_EVENTS_AFTER_CLEANUP: {total_after}")
+    
+    cur.close()
     conn.close()
-    return {"deleted": total_deleted, "total_after": total_events}
+    return {"deleted": total_deleted, "total_after": total_after}
 
 if __name__ == "__main__":
-    v_stats = ensure_views()
-    print(f"VIEWS: {v_stats}")
-    c_stats = run_cleanup()
-    print(f"CLEANUP: {c_stats}")
+    run_cleanup()
+    ensure_views()

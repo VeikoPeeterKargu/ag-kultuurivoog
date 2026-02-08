@@ -1,17 +1,18 @@
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Query, Response, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from contextlib import asynccontextmanager
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import datetime
 import logging
-from typing import Optional, List
-from pydantic import BaseModel
 import sys
+import os
 
 # Import custom modules
+import db_init
 import scrape_teater_ee
 import scrape_concert_ee
 import cleanup_non_events
@@ -24,23 +25,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_FILE = "ag_kultuurivoog.db"
+def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        logger.error("DATABASE_URL_MISSING: true")
+        raise Exception("DATABASE_URL environment variable is not set")
+    return psycopg2.connect(db_url, cursor_factory=RealDictCursor)
 
 def refresh_data():
     logger.info("--- STARTED: Scheduled Data Refresh ---")
     try:
-        # 1. Scrape Teater.ee
+        # 1. Ensure DB/Views
+        db_init.init_db()
+        
+        # 2. Scrape Teater.ee
         t_stats = scrape_teater_ee.run_scraper()
         logger.info(f"Teater.ee: {t_stats}")
         
-        # 2. Scrape Concert.ee
+        # 3. Scrape Concert.ee
         c_stats = scrape_concert_ee.run_scraper()
         logger.info(f"Concert.ee: {c_stats}")
         
-        # 3. Cleanup & Views
+        # 4. Cleanup
         cl_stats = cleanup_non_events.run_cleanup()
         logger.info(f"Cleanup: {cl_stats}")
         
+        # Log final view counts
         v_stats = cleanup_non_events.ensure_views()
         logger.info(f"Views: {v_stats}")
         
@@ -51,59 +61,48 @@ def refresh_data():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Server Startup: Initializing Scheduler")
-    scheduler = BackgroundScheduler()
+    scheduler_enabled = os.getenv("SCHEDULER_ENABLED", "1") == "1"
     
-    # Run immediately on startup (in background to not block)
-    scheduler.add_job(refresh_data, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=5))
-    
-    # Schedule every 60 minutes
-    scheduler.add_job(refresh_data, IntervalTrigger(minutes=60))
-    
-    scheduler.start()
+    if scheduler_enabled:
+        logger.info("SCHEDULER_STARTED: true")
+        logger.info("STARTUP_REFRESH_TRIGGERED: true")
+        scheduler = BackgroundScheduler()
+        
+        # Run slightly delayed to allow server start
+        scheduler.add_job(refresh_data, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=5))
+        scheduler.add_job(refresh_data, IntervalTrigger(minutes=60))
+        
+        scheduler.start()
+    else:
+        logger.info("SCHEDULER_STARTED: false")
+        
     yield
-    # Shutdown
-    logger.info("Server Shutdown: Stopping Scheduler")
-    scheduler.shutdown()
+    
+    if scheduler_enabled:
+        scheduler.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-class Event(BaseModel):
-    id: int
-    date: str
-    time: Optional[str]
-    title: str
-    genre: Optional[str]
-    venue: Optional[str]
-    city: Optional[str]
-    is_free: int
-    is_kids_event: int
-    source: str
-    source_url: Optional[str]
-    ticket_url: Optional[str]
-    canonical_event_id: str
-
-def get_db_connection():
-    conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def query_events(start_date: str, end_date: str, show_kids: bool):
     try:
         conn = get_db_connection()
+        if not conn: return []
+        
         view = "v_events_clean" if show_kids else "v_events_clean_adults"
         
-        query = f"""
-            SELECT * FROM {view}
-            WHERE date BETWEEN ? AND ?
-            ORDER BY date ASC, time ASC
-        """
-        
-        cursor = conn.execute(query, (start_date, end_date))
-        rows = cursor.fetchall()
+        with conn.cursor() as cur:
+            query = f"""
+                SELECT * FROM {view}
+                WHERE date BETWEEN %s AND %s
+                ORDER BY date ASC, time ASC
+            """
+            cur.execute(query, (start_date, end_date))
+            rows = cur.fetchall()
+            result = [dict(row) for row in rows]
+            
         conn.close()
-        return rows
+        return result
     except Exception as e:
         logger.error(f"Query failed: {e}")
         return []
@@ -135,36 +134,55 @@ def get_30days(show_kids: bool = False):
 def search_events(start: str, end: str, show_kids: bool = False):
     return query_events(start, end, show_kids)
 
+def ics_escape(text):
+    if not text: return ""
+    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
 @app.get("/events/{event_id}/ics")
 def get_event_ics(event_id: int):
-    conn = get_db_connection()
-    event = conn.execute("SELECT * FROM v_events_clean WHERE id = ?", (event_id,)).fetchone()
-    conn.close()
+    try:
+        conn = get_db_connection()
+    except Exception:
+        return Response("Database connection failed", status_code=500)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM v_events_clean WHERE id = %s", (event_id,))
+            event = cur.fetchone()
+    finally:
+        conn.close()
     
     if not event:
-        return FileResponse("static/404.html") # Or just 404 text
+        raise HTTPException(status_code=404, detail="Event not found")
 
-    # Manual ICS Generation (Variant A)
-    # 1. Format Dates
-    date_str = event['date'].replace("-", "") 
-    time_str = event['time'].replace(":", "") if event['time'] else "190000" # Default 19:00
-    if len(time_str) == 4: time_str += "00" # HHMM -> HHMMSS
+    # Manual ICS Generation (Variant A) with Escaping
+    d_obj = event['date']
+    date_str = d_obj.strftime("%Y%m%d")
+    
+    t_obj = event['time']
+    if t_obj:
+        time_str = t_obj.strftime("%H%M%S")
+    else:
+        time_str = "190000"
     
     dtstart = f"{date_str}T{time_str}"
     dtstamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     
-    # 2. Prepare content
-    summary = event['title']
-    location = f"{event['venue']}, {event['city']}" if event['city'] else event['venue']
-    if not location: location = ""
+    summary = ics_escape(event['title'])
     
-    description = event['description'] or ""
-    if event['ticket_url']: description += f"\\n\\nPiletid: {event['ticket_url']}"
-    description += f"\\n\\nAllikas: {event['source_url']}"
+    v_parts = []
+    if event['venue']: v_parts.append(event['venue'])
+    if event['city']: v_parts.append(event['city'])
+    location = ics_escape(", ".join(v_parts))
+    
+    desc_lines = []
+    if event['description']: desc_lines.append(event['description'])
+    if event['ticket_url']: desc_lines.append(f"Piletid: {event['ticket_url']}")
+    desc_lines.append(f"Allikas: {event['source_url']}")
+    description = ics_escape("\n\n".join(desc_lines))
     
     uid = f"{event['canonical_event_id']}@ag-kultuurivoog"
     
-    # 3. Assemble ICS
     ics_content = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -181,7 +199,9 @@ def get_event_ics(event_id: int):
         "END:VCALENDAR"
     ]
     
-    return Response(content="\\r\\n".join(ics_content), media_type="text/calendar", headers={"Content-Disposition": f"attachment; filename=event_{event_id}.ics"})
+    print("ICS_ENDPOINT_OK: true")
+
+    return Response(content="\r\n".join(ics_content), media_type="text/calendar", headers={"Content-Disposition": f"attachment; filename=event_{event_id}.ics"})
 
 @app.get("/")
 def root():
