@@ -18,3 +18,6 @@ Hetkel toetab: `teater.ee`, `concert.ee`.
 
 Uses SQLite `ag_kultuurivoog.db`.
 Schema defined in `schema.sql`.
+
+## Project Status: On Pause
+See `docs/PAUSE_POINT.md` for resume instructions.
